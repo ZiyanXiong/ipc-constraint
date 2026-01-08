@@ -1,0 +1,3 @@
+[submodule "Exact-Root-Parity-CCD"]
+	path = Exact-Root-Parity-CCD
+	url = https://github.com/Continuous-Collision-Detection/Exact-Root-Parity-CCD.git
