@@ -39,7 +39,7 @@
 #include <tbb/parallel_reduce.h>
 
 // DOUBLECCD
-#include <doubleCCD/doubleccd.hpp>
+//#include <doubleCCD/doubleccd.hpp>
 
 // Third-party
 #include <igl/Timer.h>
@@ -121,6 +121,7 @@ protected:
 // ==============================================================================
 struct SimStatistics {
     igl::Timer timer;
+    igl::Timer init_timer;
     double total_time = 0;
     double init_time = 0;
     double objective_time = 0;
@@ -130,6 +131,7 @@ struct SimStatistics {
     int hessian_eval = 0;
     int ccd_count = 0;
 };
+
 
 // ==============================================================================
 //  APPLY CONSTRAINTS CONDITIONS
@@ -184,7 +186,16 @@ Eigen::VectorXd prepare(polyfem::State& state, Eigen::MatrixXd& sol, int t) {
         state.args["solver"]["augmented_lagrangian"]["nonlinear"], state.args["solver"]["linear"], state.units.characteristic_length());
 
     assert(sol.size() == nl_problem.full_size());
+    //polyfem::logger().info("Avaliable nonlinear solvers: ");
+    //for (std::string& solver_name : polysolve::nonlinear::Solver::available_solvers()) {
+    //    std::cout << solver_name << std::endl;
+    //}
+    //polyfem::logger().info("Avaliable linear solvers: ");
+    //for (std::string& solver_name : polysolve::linear::Solver::available_solvers()) {
+    //    std::cout << solver_name << std::endl;
+    //}
 
+    //polyfem::logger().info("Augmented Lagrangian Solver:[{}], [{}]", state.args["solver"]["augmented_lagrangian"]["nonlinear"].dump(), state.args["solver"]["linear"].dump());
     Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
     nl_problem.use_reduced_size();
     nl_problem.line_search_begin(sol, tmp_sol);
@@ -252,7 +263,8 @@ class MexFunction : public matlab::mex::Function {
 	static std::vector<double> t_list;
     static SimStatistics sim_stat;
     static std::unique_ptr<ipc::Candidates> candidates;
-
+    static double bc_al_weight;
+    static double bc_initial_error;
 public:
     void operator()(ArgumentList outputs, ArgumentList inputs) {
 
@@ -267,8 +279,8 @@ public:
         spdlog::logger& p_logger = polyfem::logger();
         p_logger.sinks().clear();
         p_logger.sinks().push_back(matlab_sink);
-        p_logger.set_level(spdlog::level::info);
-        p_logger.flush_on(spdlog::level::info);
+        p_logger.set_level(spdlog::level::debug);
+        p_logger.flush_on(spdlog::level::debug);
         //std::cout << "Logger name: " << p_logger.name() << "Current level: " << (int)p_logger.level() << std::endl;
 
         try {
@@ -281,12 +293,407 @@ public:
             uint64_t ptr_val = handleArr[0];
             if (ptr_val == 0) throw std::runtime_error("Received null state pointer.");
             polyfem::State* state = reinterpret_cast<polyfem::State*>(ptr_val);
+            // --------------------------------------------------------------
+            // COMMAND: INIT
+            // Usage: polyfem_problem_mex('init_bc', handle, sol, t)
+            // --------------------------------------------------------------
+            if (cmd == "init") {
+                Eigen::MatrixXd sol;
+                int t;
+
+                // Accept Inputs 
+                if (inputs.size() == 4 && inputs[2].getType() == ArrayType::DOUBLE) {
+                    matlabToEigen(inputs[2], sol);
+                    t = getInt(inputs[3]);
+                }
+                else {
+                    throw std::runtime_error("Invalid input arguments. Usage: polyfem_problem_mex('init', handle, sol, t)");
+                }
+                //sim_stat.timer.start();
+                //sim_stat.init_timer.start();
+                using namespace polyfem::solver; // For ALSolver, NLProblem
+
+                const double t0 = state->args["time"]["t0"];
+                const int time_steps = state->args["time"]["time_steps"];
+                const double dt = state->args["time"]["dt"];
+                polyfem::logger().info("{}/{}  t={}", t, time_steps, t0 + dt * t);
+                assert(state.solve_data.nl_problem != nullptr);
+                NLProblem& nl_problem = *(state->solve_data.nl_problem);
+
+                assert(sol.size() == state.rhs.size());
+
+                if (nl_problem.uses_lagging())
+                {
+                    POLYFEM_SCOPED_TIMER("Initializing lagging");
+                    nl_problem.init_lagging(sol);
+                    polyfem::logger().info("Lagging iteration 1:");
+                }
+
+                // --------------------------------------------------------------------
+
+                const Eigen::VectorXd initial_sol = sol;
+                Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                assert(tmp_sol.size() == nl_problem.reduced_size());
+
+                // --------------------------------------------------------------------
+                const std::vector<std::shared_ptr<polyfem::solver::AugmentedLagrangianForm>>& alagr_forms = state->solve_data.al_form;
+                bc_al_weight = state->args["solver"]["augmented_lagrangian"]["initial_weight"];
+                int al_steps = 0;
+
+                bc_initial_error = 0;
+                for (const auto& f : alagr_forms)
+                    bc_initial_error += f->compute_error(sol);
+
+                for (auto& f : alagr_forms)
+                    f->set_initial_weight(bc_al_weight);
+
+                double current_error = 0;
+                for (const auto& f : alagr_forms)
+                    current_error += f->compute_error(sol);
+
+                logger().debug("Initial error = {}", current_error);
+                logger().debug("fvalue = {}, is_step_valid = {}, is_step_collision_free = {}", nl_problem.value(tmp_sol), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol));
+                V_prev = state->collision_mesh.displace_vertices(utils::unflatten(sol, state->collision_mesh.dim()));
+                sol_ls_0 = sol;
+                sol_ls_1 = sol;
+            }
+            // --------------------------------------------------------------
+            // COMMAND: SOLVE_BC
+            // Usage: [sol] = polyfem_problem_mex('init_bc', handle, sol)
+            // --------------------------------------------------------------
+            else if (cmd == "solve_bc") {
+                Eigen::MatrixXd sol;
+                int t;
+                // Accept Inputs 
+                if (inputs.size() == 4 && inputs[2].getType() == ArrayType::DOUBLE) {
+                    matlabToEigen(inputs[2], sol);
+                    t = getInt(inputs[3]);
+                }
+                else {
+                    throw std::runtime_error("Invalid input arguments. Usage: [sol] = polyfem_problem_mex('solve_bc', handle, sol, t)");
+                }
+
+                const double t0 = state->args["time"]["t0"];
+                const int time_steps = state->args["time"]["time_steps"];
+                const double dt = state->args["time"]["dt"];
+                polyfem::logger().info("{}/{}  t={}", t, time_steps, t0 + dt * t);
+                assert(state.solve_data.nl_problem != nullptr);
+                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
+                double eta_tol = state->args["solver"]["augmented_lagrangian"]["eta"];
+                double max_weight = state->args["solver"]["augmented_lagrangian"]["max_weight"];
+                double scaling = state->args["solver"]["augmented_lagrangian"]["scaling"];
+
+                assert(sol.size() == state.rhs.size());
+
+                if (nl_problem.uses_lagging())
+                {
+                    POLYFEM_SCOPED_TIMER("Initializing lagging");
+                    nl_problem.init_lagging(sol);
+                    polyfem::logger().info("Lagging iteration 1:");
+                }
+
+                // ---------------------------------------------------------------------
+
+                // Save the subsolve sequence for debugging
+                int subsolve_count = 0;
+                state->save_subsolve(subsolve_count, t, sol, Eigen::MatrixXd());
+
+                // ---------------------------------------------------------------------
+                //{
+                //    polyfem::solver::ALSolver al_solver(
+                //        state->solve_data.al_form,
+                //        state->args["solver"]["augmented_lagrangian"]["initial_weight"],
+                //        state->args["solver"]["augmented_lagrangian"]["scaling"],
+                //        state->args["solver"]["augmented_lagrangian"]["max_weight"],
+                //        state->args["solver"]["augmented_lagrangian"]["eta"],
+                //        [&](const Eigen::VectorXd& x) {
+                //            state->solve_data.update_barrier_stiffness(sol);
+                //        });
+
+                //    al_solver.post_subsolve = [&](const double al_weight) {
+                //        state->stats.solver_info.push_back(
+                //            { {"type", al_weight > 0 ? "al" : "rc"},
+                //                {"t", t} });
+                //        if (al_weight > 0)
+                //            state->stats.solver_info.back()["weight"] = al_weight;
+                //        state->save_subsolve(++subsolve_count, t, sol, Eigen::MatrixXd());
+                //        };
+
+                //    al_solver.solve_al(nl_problem, sol,
+                //        state->args["solver"]["augmented_lagrangian"]["nonlinear"], state->args["solver"]["linear"], state->units.characteristic_length());
+                //}
+
+                {
+                    assert(sol.size() == nl_problem.full_size());
+
+                    const Eigen::VectorXd initial_sol = sol;
+                    Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                    assert(tmp_sol.size() == nl_problem.reduced_size());
+
+                    // --------------------------------------------------------------------
+                    const std::vector<std::shared_ptr<polyfem::solver::AugmentedLagrangianForm>>& alagr_forms = state->solve_data.al_form;
+                    bc_al_weight = state->args["solver"]["augmented_lagrangian"]["initial_weight"];
+                    int al_steps = 0;
+
+                    bc_initial_error = 0;
+                    for (const auto& f : alagr_forms)
+                        bc_initial_error += f->compute_error(sol);
+
+                    nl_problem.use_reduced_size();
+                    nl_problem.line_search_begin(sol, tmp_sol);
+
+                    for (auto& f : alagr_forms)
+                        f->set_initial_weight(bc_al_weight);
+
+                    double current_error = 0;
+                    for (const auto& f : alagr_forms)
+                        current_error += f->compute_error(sol);
+
+                    logger().debug("Initial error = {}", current_error);
+                    logger().debug("fvalue = {}, is_step_valid = {}, is_step_collision_free = {}", nl_problem.value(tmp_sol), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol));
+                    while (!std::isfinite(nl_problem.value(tmp_sol))
+                        || !nl_problem.is_step_valid(sol, tmp_sol)
+                        || !nl_problem.is_step_collision_free(sol, tmp_sol))
+                    {
+                        nl_problem.line_search_end();
+
+                        nl_problem.use_full_size();
+                        logger().info("Solving AL Problem with weight {}", bc_al_weight);
+
+                        nl_problem.init(sol);
+                        //update_barrier_stiffness(sol);
+                        state->solve_data.update_barrier_stiffness(sol);
+                        tmp_sol = sol;
+
+                        try
+                        {
+                            const auto scale = nl_problem.normalize_forms();
+                            auto nl_solver = polysolve::nonlinear::Solver::create(
+                                state->args["solver"]["augmented_lagrangian"]["nonlinear"], state->args["solver"]["linear"], state->units.characteristic_length() * scale, logger());
+
+                            nl_solver->minimize(nl_problem, tmp_sol);
+                            nl_problem.finish();
+                        }
+                        catch (const std::runtime_error& e)
+                        {
+                            std::string err_msg = e.what();
+                            // if the nonlinear solve fails due to invalid energy at the current solution, changing the weights would not help
+                            if (err_msg.find("f(x) is nan or inf; stopping") != std::string::npos)
+                                log_and_throw_error("Failed to solve with AL; f(x) is nan or inf");
+                            if (err_msg.find("Reached iteration limit") != std::string::npos)
+                                log_and_throw_error("Reached iteration limit in AL");
+                        }
+
+                        sol = tmp_sol;
+
+                        current_error = 0;
+                        for (const auto& f : alagr_forms)
+                            current_error += f->compute_error(sol);
+                        logger().debug("Current error = {}", current_error);
+                        const double eta = 1 - sqrt(current_error / bc_initial_error);
+
+                        logger().debug("Current eta = {}", eta);
+
+                        if (eta < 0)
+                        {
+                            logger().debug("Higher error than initial, increase weight and revert to previous solution");
+                            sol = initial_sol;
+                        }
+
+                        nl_problem.use_reduced_size();
+                        tmp_sol = nl_problem.full_to_reduced(sol);
+                        nl_problem.line_search_begin(sol, tmp_sol);
+                        logger().debug("eta tol = {}, max_al_weight = {}, scale = {}", eta_tol, max_weight, scaling);
+                        if (eta < eta_tol && bc_al_weight < max_weight)
+                            bc_al_weight *= scaling;
+
+                        for (auto& f : alagr_forms)
+                            f->update_lagrangian(sol, bc_al_weight);
+                        logger().debug("fvalue = {}, is_step_valid = {}, is_step_collision_free = {}", nl_problem.value(tmp_sol), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol));
+                        state->solve_data.update_barrier_stiffness(sol);
+                        ++al_steps;
+                    }
+                    nl_problem.line_search_end();
+                }
+
+                assert(sol.size() == nl_problem.full_size());
+                Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                nl_problem.use_reduced_size();
+                nl_problem.line_search_begin(sol, tmp_sol);
+
+                if (!std::isfinite(nl_problem.value(tmp_sol))
+                    || !nl_problem.is_step_valid(sol, tmp_sol)
+                    || !nl_problem.is_step_collision_free(sol, tmp_sol))
+                    polyfem::log_and_throw_error("Failed to apply constraints conditions; solve with augmented lagrangian first!");
+                nl_problem.line_search_end();
+
+                // --------------------------------------------------------------------
+                // Perform one final solve with the DBC projected out
+                polyfem::logger().debug("Successfully applied constraints conditions; solving in reduced space");
+                nl_problem.init(sol);
+                state->solve_data.update_barrier_stiffness(sol);
+                
+                outputs[0] = eigenToMatlab(tmp_sol);
+            }
+            // --------------------------------------------------------------
+            // COMMAND: CHECK_CONVERGENCE_BC
+            // Usage: [is_converged] = polyfem_problem_mex('check_convergence_bc', handle, sol)
+            // --------------------------------------------------------------
+            else if (cmd == "check_convergence_bc") {
+                Eigen::MatrixXd sol;
+
+                // Accept Inputs 
+                if (inputs.size() == 3 && inputs[2].getType() == ArrayType::DOUBLE) {
+                    matlabToEigen(inputs[2], sol);
+                }
+                else {
+                    throw std::runtime_error("Invalid input arguments. Usage: [is_converged] = polyfem_problem_mex('check_convergence_bc', handle, sol)");
+                }
+                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
+                const std::vector<std::shared_ptr<polyfem::solver::AugmentedLagrangianForm>>& alagr_forms = state->solve_data.al_form;
+                double current_error = 0;
+
+                for (const auto& f : alagr_forms)
+                    current_error += f->compute_error(sol);
+                logger().debug("Current error = {}", current_error);
+                const double eta = 1 - sqrt(current_error / bc_initial_error);
+
+                nl_problem.use_reduced_size();
+                Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                nl_problem.line_search_begin(sol, tmp_sol);
+                bool is_bc_converged = (std::isfinite(nl_problem.value(tmp_sol))
+                    && nl_problem.is_step_valid(sol, tmp_sol)
+                    && nl_problem.is_step_collision_free(sol, tmp_sol) && eta > 0.999);
+                nl_problem.line_search_end();
+
+                nl_problem.use_full_size();
+                logger().info("Solving AL Problem with weight {}", bc_al_weight);
+
+                nl_problem.init(sol);
+                //update_barrier_stiffness(sol);
+                state->solve_data.update_barrier_stiffness(sol);
+                outputs[0] = factory.createScalar<bool>(is_bc_converged);
+            }
+            // --------------------------------------------------------------
+            // COMMAND: UPDATE_AL_WEIGHT_BC
+            // Usage: polyfem_problem_mex('check_convergence_bc', handle, sol)
+            // --------------------------------------------------------------
+            else if (cmd == "update_al_weight_bc") {
+                Eigen::MatrixXd sol;
+
+                // Accept Inputs 
+                if (inputs.size() == 3 && inputs[2].getType() == ArrayType::DOUBLE) {
+                    matlabToEigen(inputs[2], sol);
+                }
+                else {
+                    throw std::runtime_error("Invalid input arguments. Usage: polyfem_problem_mex('update_al_weight_bc', handle, sol)");
+                }
+                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
+                //sol = tmp_sol;
+
+                //current_error = 0;
+                //for (const auto& f : alagr_forms)
+                //    current_error += f->compute_error(sol);
+                //logger().debug("Current error = {}", current_error);
+                //const double eta = 1 - sqrt(current_error / bc_initial_error);
+
+                //logger().debug("Current eta = {}", eta);
+
+                //if (eta < 0)
+                //{
+                //    logger().debug("Higher error than initial, increase weight and revert to previous solution");
+                //    sol = initial_sol;
+                //}
+
+                //nl_problem.use_reduced_size();
+                //tmp_sol = nl_problem.full_to_reduced(sol);
+                //nl_problem.line_search_begin(sol, tmp_sol);
+                //logger().debug("eta tol = {}, max_al_weight = {}, scale = {}", eta_tol, max_weight, scaling);
+                //if (eta < eta_tol && bc_al_weight < max_weight)
+                //    bc_al_weight *= scaling;
+
+                //for (auto& f : alagr_forms)
+                //    f->update_lagrangian(sol, bc_al_weight);
+                //logger().debug("fvalue = {}, is_step_valid = {}, is_step_collision_free = {}", nl_problem.value(tmp_sol), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol));
+                //state->solve_data.update_barrier_stiffness(sol);
+                const std::vector<std::shared_ptr<polyfem::solver::AugmentedLagrangianForm>>& alagr_forms = state->solve_data.al_form;
+                Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                double eta_tol = state->args["solver"]["augmented_lagrangian"]["eta"];
+                double max_weight = state->args["solver"]["augmented_lagrangian"]["max_weight"];
+                double scaling = state->args["solver"]["augmented_lagrangian"]["scaling"];
+                double current_error = 0;
+
+                for (const auto& f : alagr_forms)
+                    current_error += f->compute_error(sol);
+                logger().debug("Current error = {}", current_error);
+                const double eta = 1 - sqrt(current_error / bc_initial_error);
+
+                logger().debug("Current eta = {}", eta);
+
+                if (eta < 0)
+                {
+                    logger().info("Higher error than initial, increase weight and revert to previous solution");
+                    sol = sol_ls_0;
+                }
+
+                if (eta < eta_tol && bc_al_weight <max_weight)
+                    bc_al_weight *= scaling;
+
+                for (auto& f : alagr_forms)
+                    f->update_lagrangian(sol, bc_al_weight);
+                logger().debug("fvalue = {}, is_step_valid = {}, is_step_collision_free = {}", nl_problem.value(tmp_sol), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol));
+                state->solve_data.update_barrier_stiffness(sol);
+            }
+            // --------------------------------------------------------------
+            // COMMAND: FIX_BC
+            // Usage: [sol_reduced] = polyfem_problem_mex('fix_bc', handle, sol, t)
+            // --------------------------------------------------------------
+            else if (cmd == "fix_bc") {
+                Eigen::MatrixXd sol;
+
+                // Accept Inputs 
+                if (inputs.size() == 3 && inputs[2].getType() == ArrayType::DOUBLE) {
+                    matlabToEigen(inputs[2], sol);
+                }
+                else {
+                    throw std::runtime_error("Invalid input arguments. Usage: [sol_reduced] = polyfem_problem_mex('fix_bc', handle, sol)");
+                }
+
+                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
+                nl_problem.use_reduced_size();
+                Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
+                nl_problem.line_search_begin(sol, tmp_sol);
+
+                if (!std::isfinite(nl_problem.value(tmp_sol))
+                    || !nl_problem.is_step_valid(sol, tmp_sol)
+                    || !nl_problem.is_step_collision_free(sol, tmp_sol))
+                    polyfem::log_and_throw_error("Failed to apply constraints conditions; solve with augmented lagrangian first!");
+                nl_problem.line_search_end();
+
+                // --------------------------------------------------------------------
+                // Perform one final solve with the DBC projected out
+                polyfem::logger().debug("Successfully applied constraints conditions; solving in reduced space");
+                nl_problem.init(sol);
+                state->solve_data.update_barrier_stiffness(sol);
+
+                V_prev = state->collision_mesh.displace_vertices(utils::unflatten(sol, state->collision_mesh.dim()));
+                sol_ls_0 = tmp_sol;
+                sol_ls_1 = tmp_sol;
+                if (candidates) {
+                    candidates.reset();
+                    mexUnlock();
+                }
+                candidates = std::make_unique<ipc::Candidates>();
+                //sim_stat.init_timer.stop();
+                //sim_stat.init_time += sim_stat.init_timer.getElapsedTime();
+                outputs[0] = eigenToMatlab(tmp_sol);
+            }
 
             // --------------------------------------------------------------
             // COMMAND: PREPARE
             // Usage: [sol, sol_reduced] = polyfem_problem_mex('prepare', handle, sol, t)
             // --------------------------------------------------------------
-            if (cmd == "prepare") {
+            else if (cmd == "prepare") {
                 Eigen::MatrixXd sol;
                 int t;
                 double inflation_radius;
@@ -344,14 +751,14 @@ public:
             // --------------------------------------------------------------
             else if (cmd == "eval_f") {
                 Eigen::MatrixXd sol;
-                Eigen::VectorXd tmp_sol;
+                //Eigen::VectorXd tmp_sol;
                 // Accept Inputs 
-                if (inputs.size() == 4 && inputs[2].getType() == ArrayType::DOUBLE && inputs[3].getType() == ArrayType::DOUBLE) {
+                if (inputs.size() == 3 && inputs[2].getType() == ArrayType::DOUBLE) {
                     matlabToEigen(inputs[2], sol);
-                    matlabToEigen(inputs[3], tmp_sol);
+                    //matlabToEigen(inputs[3], tmp_sol);
                 }
                 else {
-                    throw std::runtime_error("Invalid input arguments. Usage: [f,g] = polyfem_problem_mex('eval_c', handle, sol_reduced)");
+                    throw std::runtime_error("Invalid input arguments. Usage: [f,g] = polyfem_problem_mex('eval_c', handle, sol)");
                 }
                 igl::Timer timer;
                 // Start the timer
@@ -361,14 +768,20 @@ public:
                 polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
                 double f = 0.0;
                 Eigen::VectorXd grad;
-				nl_problem.solution_changed(tmp_sol);
+				nl_problem.solution_changed(sol);
                 //bool is_step_valid = true;
 
 				igl::Timer collision_timer;
 				collision_timer.start();
                 const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
+                
+                Eigen::MatrixXd V;
+                if(sol.size() == nl_problem.full_size())
+                    V = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
+                else
+                    V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(sol), collision_mesh.dim()));
                 bool is_step_valid = !ipc::has_intersections(collision_mesh, V, std::make_shared<ipc::SweepAndPrune>());
+                //bool is_step_valid = true;
 
                 //if(is_step_valid)
                 //    is_step_valid = nl_problem.is_step_collision_free(nl_problem.full_to_reduced(sol), tmp_sol);
@@ -386,152 +799,82 @@ public:
                     }
                 }
                 */
-
+                
                 if(is_step_valid)
                 {
                     ipc::Candidates& collisions = *candidates;
                     double dhat = polyfem::Units::convert(state->args["contact"]["dhat"], state->units.length());
-                    polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
                     const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                    Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
-                    Eigen::MatrixXd V0 = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
                     const int ndof = collision_mesh.num_vertices() * collision_mesh.dim();
-                    assert(V.rows() == collision_mesh.num_vertices());
-                    assert(V0.rows() == collision_mesh.num_vertices());
-                    if(outputs.size() > 2)
-                        collisions.build(collision_mesh, V_prev, V, dhat / 2, std::make_shared<ipc::SweepAndPrune>());
+                    Eigen::VectorXd dsol = sol - sol_ls_0;
+                    Eigen::VectorXd ls_direction = (sol_ls_1 - sol_ls_0).normalized();
+                    bool is_linesearch = (abs(ls_direction.dot(dsol) - dsol.norm()) < 1e-9) && ((sol_ls_1 - sol_ls_0).norm() > 1e-9);
+                    double t = 1.0;
+
+                    //if (is_linesearch) {
+                    //    t = dsol.norm() / (sol_ls_1 - sol_ls_0).norm();
+                    //}
+                    //else {
+                    //    collisions.build(collision_mesh, V_prev, V, dhat / 2, std::make_shared<ipc::SweepAndPrune>());
+                    //    sol_ls_1 = tmp_sol;
+                    //    t_list.resize(collisions.size());
+                    //    sim_stat.ccd_count++;
+                    //}
+                    /*
                     if (!collisions.empty()) {
                         const Eigen::MatrixXi& E = collision_mesh.edges();
                         const Eigen::MatrixXi& F = collision_mesh.faces();
-                        //Eigen::MatrixXd V_ls_0 = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(sol_ls_0), collision_mesh.dim()));
-                        //printToMatlab("Mesh statistics, vertices number: " + std::to_string(V.size() / 3) + ", edge number: " + std::to_string(E.size() / 2) + ", face number : " + std::to_string(F.size() / 3) + '\n');
-                        /*
-                        for (size_t i = 0; i < collisions.size(); i++) {
-                            double toi = 0;
-                            bool is_colliding = false;
-                            ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                            ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                            ipc::VectorMax12d dof_prev = collisions[i].dof(V_prev, E, F);
-                            double d_prev = sqrt(collisions[i].compute_distance(dof_prev));
-                            double d = sqrt(collisions[i].compute_distance(dof));
-                            ipc::VectorMax12d local_grad_prev = collisions[i].compute_distance_gradient(dof_prev);
-                            ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-                            double c_approx = -d_prev + local_grad_prev.dot(dof - dof_prev) / (2 * d_prev);
-
-                            ////printToMatlab("ccd candidate: " + std::to_string(i) + ", dof0: " + eigenToString(collisions[i].dof(V_ls_0, E, F).transpose()) + ", dof : " + eigenToString(dof.transpose()) + "\n");
-                            igl::Timer ccd_timer;
-                            ccd_timer.start();
-                            if(is_linesearch){
-                                is_colliding = (t_ls > t_list[i]);
-                            }
-                            else {
-                                is_colliding = collisions[i].ccd(dof0, dof, toi);
-                                //t_list.push_back(toi);
-                            }
-                            ccd_timer.stop();
-                            double ccd_time = ccd_timer.getElapsedTimeInMicroSec();
-                            //printToMatlab("tight inclusion ccd_time : " + std::to_string(ccd_time) + "us \n");
-                            //if (abs(d - abs(c_approx)) < 1e-3 && d > 1e-2) {
-                            //    is_colliding = !std::signbit(c_approx);
-                            //    //printToMatlab("ccd candidate " + std::to_string(i) + ", d0: " + std::to_string(d0) + ", d: " + std::to_string(d) + ", c_approx: " + std::to_string(c_approx) + '\n');
-                            //}
-                            //else
-                            ccd_timer.start();
-                            {
-                                if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size())
-                                    continue;
-                                else if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size() + collisions.ee_candidates.size())
-                                    is_colliding = doubleccd_edge_edge(dof0, dof);
-                                else if (i < collisions.size())
-                                    is_colliding = doubleccd_vertex_face(dof0, dof);
-                                else
-                                    polyfem::log_and_throw_error("Index out of candidates range.");
-                                ccd_count++;
-                            }
-                            ccd_timer.stop();
-                            ccd_time = ccd_timer.getElapsedTimeInMicroSec();
-                           // printToMatlab("double ccd_time : " + std::to_string(ccd_time) + "us \n");
-                            if (is_colliding) {
-                                is_step_valid = false;
-                                break;
-                            }
+                        if (is_linesearch) {
+                            tbb::parallel_for(
+                                tbb::blocked_range<size_t>(0, collisions.size()),
+                                [&](tbb::blocked_range<size_t> r) {
+                                    for (size_t i = r.begin(); i < r.end(); i++) {
+                                        if (t > t_list[i]) {
+                                            is_step_valid = false;
+                                            return;
+                                        }
+                                    }
+                                });
                         }
-                        */
-                        //
-                        //igl::Timer ccd_timer;
-                        //ccd_timer.start();
-                        sim_stat.ccd_count++;
-                        tbb::parallel_for(
-                            tbb::blocked_range<size_t>(0, collisions.size()),
-                            [&](tbb::blocked_range<size_t> r) {
-                                for (size_t i = r.begin(); i < r.end(); i++) {
-                                    double toi = 0;
-                                    bool is_colliding = false;
-                                    ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                                    ipc::VectorMax12d dof0 = collisions[i].dof(V_prev, E, F);
-
-                                    is_colliding = collisions[i].ccd(dof0, dof, toi);
-
-                                    if(is_colliding)
-                                    {
-                                        if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size())
-                                            is_colliding = is_colliding;
-                                        else if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size() + collisions.ee_candidates.size())
-                                            is_colliding = doubleccd_edge_edge(dof0, dof);
-                                        else if (i < collisions.size())
-                                            is_colliding = doubleccd_vertex_face(dof0, dof);
-                                        else
-                                            polyfem::log_and_throw_error("Index out of candidates range.");
+                        else {
+                            tbb::parallel_for(
+                                tbb::blocked_range<size_t>(0, collisions.size()),
+                                [&](tbb::blocked_range<size_t> r) {
+                                    for (size_t i = r.begin(); i < r.end(); i++) {
+                                        //double toi = 0;
+                                        bool is_colliding = false;
+                                        ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
+                                        ipc::VectorMax12d dof0 = collisions[i].dof(V_prev, E, F);
+                                        is_colliding = collisions[i].ccd(dof0, dof, t_list[i]);
+                                        
+                                        //if(is_colliding)
+                                        //{
+                                        //    if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size())
+                                        //        is_colliding = is_colliding;
+                                        //    else if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size() + collisions.ee_candidates.size())
+                                        //        is_colliding = doubleccd_edge_edge(dof0, dof);
+                                        //    else if (i < collisions.size())
+                                        //        is_colliding = doubleccd_vertex_face(dof0, dof);
+                                        //    else
+                                        //        polyfem::log_and_throw_error("Index out of candidates range.");
+                                        //}
+                                        
+                                        if (is_colliding) {
+                                            is_step_valid = false;
+                                        }
                                     }
-
-                                    if (is_colliding) {
-                                        is_step_valid = false;
-                                        return;
-                                    }
-                                }
-                            });
-                        //ccd_timer.stop();
-                        //double ccd_time = ccd_timer.getElapsedTime();
-                        //printToMatlab("double ccd_time : " + std::to_string(ccd_time) + "s \n");
-                        //printToMatlab("Candidate size: " + std::to_string(collisions.size()) + ",ccd size:" + std::to_string(ccd_count) +'\n');
-
-                        //ccd_timer.start();
-                        //collisions.compute_collision_free_stepsize(collision_mesh, V0, V);
-                        //tbb::parallel_for(
-                        //    tbb::blocked_range<size_t>(0, collisions.size()),
-                        //    [&](tbb::blocked_range<size_t> r) {
-                        //        for (size_t i = r.begin(); i < r.end(); i++) {
-                        //            const ipc::CollisionStencil& candidate = collisions[i];
-                        //            ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                        //            ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                        //            double toi = std::numeric_limits<double>::infinity(); // output
-                        //            const bool are_colliding = candidate.ccd(
-                        //                dof0,
-                        //                dof, //
-                        //                toi);
-
-                        //        }
-                        //    });
-                        //ccd_timer.stop();
-                        //ccd_time = ccd_timer.getElapsedTime();
-                        //printToMatlab("tight inclusion ccd_time : " + std::to_string(ccd_time) + "s \n");
-                        //
-                        //ccd_timer.start();
-                        //ipc::has_intersections(collision_mesh, V, std::make_shared<ipc::SweepAndPrune>());
-                        //ccd_timer.stop();
-                        //ccd_time = ccd_timer.getElapsedTime();
-                        //printToMatlab("dcd time : " + std::to_string(ccd_time) + "s \n");
-                        
+                                });
+                        }
                     }
+                    */
                 }
-                if (is_step_valid)
-                    V_prev = V;
+                
 				collision_timer.stop();
 				sim_stat.collision_time += collision_timer.getElapsedTime();
                 sim_stat.func_eval++;
-
+                
                 if (outputs.size() > 0) {
-                    f = nl_problem(tmp_sol);
+                    f = nl_problem(sol);
                     if (!is_step_valid) {
                         //f = std::numeric_limits<double>::infinity();
                         f = std::numeric_limits<double>::quiet_NaN();
@@ -539,20 +882,20 @@ public:
                     outputs[0] = factory.createScalar<double>(f);
                 }
                 if (outputs.size() > 1) {
-                    nl_problem.gradient(tmp_sol, grad);
+                    nl_problem.gradient(sol, grad);
                     outputs[1] = eigenToMatlab(grad);
                 }
                 if (outputs.size() > 2) {
                     //Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-                    sim_stat.hessian_eval++;
                     Eigen::SparseMatrix<double> hessian;
+
                     if (is_step_valid) {
                         //logger().debug("Grad Norm: {:g}", grad.norm());
-                        if (grad.lpNorm<Eigen::Infinity>() > 1e-0) 
+                        if (grad.lpNorm<Eigen::Infinity>() > 1e-4) 
                         {
                             try {
                                 nl_problem.set_project_to_psd(true);
-                                nl_problem.hessian(tmp_sol, hessian);
+                                nl_problem.hessian(sol, hessian);
                             }
                             catch (const std::runtime_error& e) {
                                 // Code to handle the specific exception type
@@ -562,9 +905,10 @@ public:
                         }
                         else 
                         {
-                            logger().info("Switch to unprojected hessian");
+                            //logger().info("Switch to unprojected hessian");
+                            sim_stat.hessian_eval++;
                             nl_problem.set_project_to_psd(false);
-                            nl_problem.hessian(tmp_sol, hessian);
+                            nl_problem.hessian(sol, hessian);
 
                             igl::Timer factorization_timer;
                             factorization_timer.start();
@@ -579,35 +923,23 @@ public:
                                 logger().info("hessian is not positive definite");
                                 try {
                                     nl_problem.set_project_to_psd(true);
-                                    nl_problem.hessian(tmp_sol, hessian);
+                                    nl_problem.hessian(sol, hessian);
                                 }
                                 catch (const std::runtime_error& e) {
                                     // Code to handle the specific exception type
-                                    logger().info("Invalid hessian, return 0 hessian");
+                                    //logger().info("Invalid hessian, return 0 hessian");
                                     hessian.setZero();
                                 }
 							}
                             factorization_timer.stop();
                             sim_stat.extra_factorizing_time += factorization_timer.getElapsedTime();
-                            //if (params["solver_info"] != "Success") {
-                            //    logger().info("hessian is not positive definite");
-                            //    hessian.setZero();
-                            //    try {
-                            //        nl_problem.set_project_to_psd(true);
-                            //        nl_problem.hessian(tmp_sol, hessian);
-                            //    }
-                            //    catch (const std::runtime_error& e) {
-                            //        // Code to handle the specific exception type
-                            //        logger().info("Invalid hessian, return 0 hessian");
-                            //        hessian.setZero();
-                            //    }
-                            //}
                         }
-                        //nl_problem.set_project_to_psd(false);
+                        sol_ls_0 = sol;
+                        V_prev = V;
                     }
                     outputs[2] = eigenSparseToMatlab(hessian);
                     json solver_info;
-                    nl_problem.post_step(polysolve::nonlinear::PostStepData(1, solver_info, tmp_sol, grad));
+                    nl_problem.post_step(polysolve::nonlinear::PostStepData(1, solver_info, sol, grad));
                 }
 
                 // Stop the timer
@@ -619,808 +951,102 @@ public:
                 //printToMatlab("Time for eval_f : " + std::to_string(elapsed_time) + " seconds\n");
             }
             // --------------------------------------------------------------
-            // COMMAND: EVAL_C
-            // Usage: [f,g, h] = polyfem_problem_mex('eval_c', handle, sol, sol_reduced)
+            // COMMAND: HESSIAN_PATTERN
+            // Usage: h = polyfem_problem_mex('hessian_pattern', handle, x ,x_r)
             // --------------------------------------------------------------
-            else if (cmd == "eval_c") {
-                Eigen::VectorXd tmp_sol;
+            else if (cmd == "hessian_pattern") {
                 Eigen::MatrixXd sol;
-
+                Eigen::VectorXd tmp_sol;
                 // Accept Inputs 
                 if (inputs.size() == 4 && inputs[2].getType() == ArrayType::DOUBLE && inputs[3].getType() == ArrayType::DOUBLE) {
                     matlabToEigen(inputs[2], sol);
                     matlabToEigen(inputs[3], tmp_sol);
                 }
                 else {
-                    throw std::runtime_error("Invalid input arguments. Usage: [f,g,h] = polyfem_problem_mex('eval_c', handle, sol_reduced)");
+                    throw std::runtime_error("Invalid input arguments. Usage: h = polyfem_problem_mex('hessian_pattern', handle, x, x_r)");
                 }
-
                 igl::Timer timer;
                 // Start the timer
                 timer.start();
-                //printToMatlab("Start eval_c... \n");
-#ifdef USE_PERSISTANT_CANDIDATES
-                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
-                const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
-                Eigen::MatrixXd V0 = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
-                assert(V.rows() == collision_mesh.num_vertices());
-                assert(V0.rows() == collision_mesh.num_vertices());
-                const int ndof = collision_mesh.num_vertices() * collision_mesh.dim();
-                const int nc = candidates->size();
-                const Eigen::MatrixXi& E = collision_mesh.edges();
-                const Eigen::MatrixXi& F = collision_mesh.faces();
-                Eigen::VectorXd c_parallel = Eigen::VectorXd::Zero(nc, 1);
-                Eigen::MatrixXd grad_parallel = Eigen::MatrixXd::Zero(tmp_sol.size(), nc);
-                std::vector<Eigen::SparseMatrix<double>> hessian_parallel(nc);
-				ipc::Candidates& collisions = *candidates;
-                
-                // A. Parallel Computation
-                tbb::parallel_for(tbb::blocked_range<size_t>(0, nc),
-                    [&](const tbb::blocked_range<size_t>& r) {
-                        for (size_t i = r.begin(); i != r.end(); i++) {
-                            double toi = 0;
-                            ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                            ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                            double d = sqrt(collisions[i].compute_distance(dof));
-                            if (!collisions[i].ccd(dof0, dof, toi)) {
-                                d = -d;
-                            }
-                            if (d > 0) {
-                                c_parallel[i] = d + 5e-4;
-                                if (outputs.size() > 1) {
-                                    auto v_ids = collisions[i].vertex_ids(E, F);
-                                    Eigen::MatrixXd grad_full = Eigen::MatrixXd::Zero(ndof, 1);
-                                    ipc::local_gradient_to_global_gradient(collisions[i].compute_distance_gradient(dof) / (2 * d), v_ids, collision_mesh.dim(), grad_full);
-                                    grad_parallel.col(i) = nl_problem.full_to_reduced_grad(grad_full);
-                                }
-                                if (outputs.size() > 2) {
-                                    // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                                    ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-                                    ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                                    std::vector<Eigen::Triplet<double>> hessian_triplets;
-                                    local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                                    auto v_ids = collisions[i].vertex_ids(E, F);
-                                    ipc::local_hessian_to_global_triplets(
-                                        ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::NONE),
-                                        v_ids, collision_mesh.dim(), hessian_triplets
-                                    );
-                                    hessian_parallel[i].resize(ndof, ndof);
-                                    hessian_parallel[i].setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                                    nl_problem.full_hessian_to_reduced_hessian(hessian_parallel[i]);
-                                }
-                            }
-                            else {
-                                hessian_parallel[i].resize(ndof, ndof);
-                                nl_problem.full_hessian_to_reduced_hessian(hessian_parallel[i]);
-                            }
-                        }
-                    }
-                );
-                if (outputs.size() > 0)
-                    outputs[0] = eigenToMatlab(c_parallel);
-                if (outputs.size() > 1) {
-                    outputs[1] = eigenToMatlab(grad_parallel);
-                }
-                if (outputs.size() > 2) {
-                    CellArray cellContainer = factory.createCellArray({ 1, static_cast<unsigned long long>(nc) });
-                    for (size_t i = 0; i < nc; i++) {
-                        cellContainer[i] = eigenSparseToMatlab(hessian_parallel[i]);
-                    }
-                    outputs[2] = cellContainer;
-                }
-#else
-                //ipc::Candidates candidates;
-				ipc::Candidates& collisions = *candidates;
-                double dhat = polyfem::Units::convert(state->args["contact"]["dhat"], state->units.length());
-                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
-                const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
-                Eigen::MatrixXd V0 = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
-                const int ndof = collision_mesh.num_vertices() * collision_mesh.dim();
-                assert(V.rows() == collision_mesh.num_vertices());
-                assert(V0.rows() == collision_mesh.num_vertices());
-                double c_parallel = 0;
-                Eigen::VectorXd grad_parallel = Eigen::VectorXd::Zero(tmp_sol.size());
-                Eigen::SparseMatrix<double> hessian_parallel;
-                std::vector<Eigen::Triplet<double>> constraint_hessian_triplets_parallel;
-
-                Eigen::VectorXd dsol = tmp_sol - sol_ls_0;
-                Eigen::VectorXd ls_direction = (sol_ls_1 - sol_ls_0).normalized();
-                bool is_linesearch = (abs(ls_direction.dot(dsol) - dsol.norm()) < 1e-8) && ((sol_ls_1 - sol_ls_0).norm() > 1e-8);
-                //printToMatlab("Is current step in line search? " + std::to_string(is_linesearch) + ", (tmp_sol - sol_ls_0).norm: " + std::to_string(dsol.norm()) + ", (sol_ls_1 - sol_ls_0).norm: " + std::to_string((sol_ls_1 - sol_ls_0).norm()) + ", ls_direction.dot(dsol): " + std::to_string(ls_direction.dot(dsol)) + '\n');
-                printToMatlab("Is current step in line search? " + std::to_string(is_linesearch) + ", tmp_sol: (" + eigenToString(tmp_sol.head(3).transpose()) + "), sol_ls_1: (" + eigenToString(sol_ls_1.head(3).transpose()) + "), sol_ls_0: (" + eigenToString(sol_ls_0.head(3).transpose()) + ")\n");
-                double t_ls = 1.0;
-                //is_linesearch = false;
-                if (is_linesearch) 
-					t_ls = dsol.norm() / (sol_ls_1 - sol_ls_0).norm();
-                else{
-                    collisions.clear();
-                    collisions.build(collision_mesh, V0, V, dhat / 2, std::make_shared<ipc::SweepAndPrune>());
-                    sol_ls_0 = sol_ls_1;
-					sol_ls_1 = tmp_sol;
-                    t_list.clear();
-                }
-                /*
-                //printToMatlab("Candidate size : " + std::to_string(candidates.size()) + " \n");
-				if (candidates.size() > 5000) {
-                    printToMatlab("V0: " + eigenToString(V0.topLeftCorner(16,3).transpose()) + "\n");
-                    printToMatlab("V: " + eigenToString(V.topLeftCorner(16, 3).transpose()) + "\n");
-                    printToMatlab("tmp_sol: " + eigenToString(tmp_sol.transpose()) + "\n");
-                }
-                */
-                int ccd_count = 0;
-                if (!collisions.empty()) {
-                    using TripletVector = std::vector<Eigen::Triplet<double>>;
-                    tbb::combinable<double> c_storage;
-                    tbb::combinable<Eigen::VectorXd> grad_storage(Eigen::VectorXd::Zero(tmp_sol.size()));
-                    tbb::enumerable_thread_specific<TripletVector> hess_storage;
-                    const Eigen::MatrixXi& E = collision_mesh.edges();
-                    const Eigen::MatrixXi& F = collision_mesh.faces();
-					ipc::TightInclusionCCD tight_ccd(1e-6, 1e8, 1.0);
-                    Eigen::MatrixXd V_ls_0 = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(sol_ls_0), collision_mesh.dim()));
-                    //printToMatlab("Mesh statistics, vertices number: " + std::to_string(V.size() / 3) + ", edge number: " + std::to_string(E.size() / 2) + ", face number : " + std::to_string(F.size() / 3) + '\n');
-
-                    for (size_t i = 0; i < collisions.size(); i++) {
-                        double toi = 0;
-                        bool is_colliding = false;
-                        ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                        ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                        ipc::VectorMax12d dof_prev = collisions[i].dof(V_prev, E, F);
-						double d_prev = sqrt(collisions[i].compute_distance(dof_prev));
-                        double d = sqrt(collisions[i].compute_distance(dof));
-                        ipc::VectorMax12d local_grad_prev = collisions[i].compute_distance_gradient(dof_prev);
-                        ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-						double c_approx = -d_prev + local_grad_prev.dot(dof - dof_prev) / (2 * d_prev);
-                        if (d < 1e-6) {
-                            std::stringstream d_string;
-                            d_string << std::scientific << d;
-                            printToMatlab("ccd candidate: " + std::to_string(i) + ", dof0: " + eigenToString(collisions[i].dof(V_ls_0, E, F).transpose()) + ", dof : " + eigenToString(dof.transpose()) + "\n");
-                            printToMatlab("d: " + d_string.str() + ", grad: " + eigenToString(local_grad.transpose()) + "\n");
-                        }
-
-                        /*
-                        printToMatlab("ccd candidate: " + std::to_string(i) + ", dof0: " + eigenToString(collisions[i].dof(V_ls_0, E, F).transpose()) + ", dof : " + eigenToString(dof.transpose()) + "\n");
-                        igl::Timer ccd_timer;
-                        ccd_timer.start();
-                        if(is_linesearch){
-                            is_colliding = (t_ls > t_list[i]);
-                        }
-                        else {
-                            is_colliding = collisions[i].ccd(collisions[i].dof(V_ls_0, E, F), dof, toi, 0.0, 1.0, tight_ccd);
-                            t_list.push_back(toi);
-						}
-                        ccd_timer.stop();
-                        double ccd_time = ccd_timer.getElapsedTime();
-                        printToMatlab("ccd_time : " + std::to_string(ccd_time) + "s \n");
-
-                        
-                        bool ccd_is_colliding = collisions[i].ccd(dof0, dof, toi, 0.0, 1.0, tight_ccd);
-						if (is_colliding != ccd_is_colliding)
-                            printToMatlab("Warning: CCD result mismatch at candidate " + std::to_string(i) + ", is_linesearch: " + std::to_string(is_linesearch) + ", t_ls: " + std::to_string(t_ls) + ", t_list[i]: " + std::to_string(t_list[i]) + ", toi: " + std::to_string(toi) + '\n');
-						is_colliding = ccd_is_colliding;
-                        */
-
-                        if (abs(d - abs(c_approx)) < 1e-3 && d > 1e-2) {
-                            is_colliding = !std::signbit(c_approx);
-                            //printToMatlab("ccd candidate " + std::to_string(i) + ", d0: " + std::to_string(d0) + ", d: " + std::to_string(d) + ", c_approx: " + std::to_string(c_approx) + '\n');
-                        }
-                        else 
-                        //if(d < 1e-5)
-                        {
-                            if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size())
-                                continue;
-                            else if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size() + collisions.ee_candidates.size())
-                                is_colliding = doubleccd_edge_edge(dof0, dof);
-                            else if (i < collisions.size())
-                                is_colliding = doubleccd_vertex_face(dof0, dof);
-                            else
-                                polyfem::log_and_throw_error("Index out of candidates range.");
-                            ccd_count++;
-                        }
-
-                        if (!is_colliding)
-                            d = -d;
-
-                        if (d > -1e-4) {
-                            c_parallel += d + 1e-4;
-                            if (outputs.size() > 1) {
-                                auto v_ids = collisions[i].vertex_ids(E, F);
-                                Eigen::MatrixXd grad_full = Eigen::MatrixXd::Zero(ndof, 1);
-                                ipc::local_gradient_to_global_gradient(local_grad / (2 * d), v_ids, collision_mesh.dim(), grad_full);
-                                grad_parallel += nl_problem.full_to_reduced_grad(grad_full);
-                            }
-                            if (outputs.size() > 2) {
-                                // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                                ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                                local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                                auto v_ids = collisions[i].vertex_ids(E, F);
-                                ipc::local_hessian_to_global_triplets(
-                                    ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::CLAMP),
-                                    v_ids, collision_mesh.dim(), constraint_hessian_triplets_parallel
-                                );
-                            }
-                        }
-					}
-                    /*
-                    // A. Parallel Computation
-                    tbb::parallel_for(tbb::blocked_range<size_t>(0, candidates.size()),
-                        [&](const tbb::blocked_range<size_t>& r) {
-                            for (size_t i = r.begin(); i != r.end(); i++) {
-                                double toi = 0;
-								bool is_colliding = false;
-                                ipc::VectorMax12d dof = candidates[i].dof(V, E, F);
-                                ipc::VectorMax12d dof0 = candidates[i].dof(V0, E, F);
-                                double d = sqrt(candidates[i].compute_distance(dof));
-								d = (dof0 - dof).norm();
-
-                                if (i < candidates.vv_candidates.size() + candidates.ev_candidates.size()) {
-                                    is_colliding = candidates[i].ccd(dof0, dof, toi);
-                                }
-                                else if (i < candidates.vv_candidates.size() + candidates.ev_candidates.size() + candidates.ee_candidates.size()) {
-                                    is_colliding = doubleccd_edge_edge(dof0, dof);
-                                }
-                                else if (i < candidates.size()) {
-                                    is_colliding = doubleccd_vertex_face(dof0, dof);
-                                }
-                                else
-                                {
-                                    polyfem::log_and_throw_error("Index out of candidates range.");
-								}
-
-                                if (!is_colliding) {
-                                    d = -d;
-                                }
-                                if (d >= -1-5) {
-                                    c_storage.local() = d;
-                                    if (outputs.size() > 1) {
-                                        auto v_ids = candidates[i].vertex_ids(E, F);
-                                        Eigen::MatrixXd grad_full = Eigen::MatrixXd::Zero(ndof, 1);
-                                        ipc::local_gradient_to_global_gradient(candidates[i].compute_distance_gradient(dof) / (2 * d), v_ids, collision_mesh.dim(), grad_full);
-                                        grad_storage.local() = nl_problem.full_to_reduced_grad(grad_full);
-                                    }
-                                    if (outputs.size() > 2) {
-                                        // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                                        ipc::VectorMax12d local_grad = candidates[i].compute_distance_gradient(dof);
-                                        ipc::MatrixMax12d local_hess = candidates[i].compute_distance_hessian(dof);
-                                        local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                                        auto v_ids = candidates[i].vertex_ids(E, F);
-                                        ipc::local_hessian_to_global_triplets(
-                                            ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::NONE),
-                                            v_ids, collision_mesh.dim(), hess_storage.local()
-                                        );
-                                    }
-                                }
-
-                            }
-                        }
-                    );
-
-                    // B. Fast Assembly (Offset + Copy)
-					c_parallel = c_storage.combine(std::plus<double>());
-                    grad_parallel = grad_storage.combine(
-                        [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
-                            return a + b;
-                        }
-					);
-
-                    // 1. Calculate offsets
-                    std::vector<size_t> offsets(hess_storage.size());
-                    size_t total_triplets = 0;
-                    size_t idx = 0;
-                    for (const auto& local : hess_storage) {
-                        offsets[idx++] = total_triplets;
-                        total_triplets += local.size();
-                    }
-
-                    // 2. Single allocation
-                    size_t start_offset = constraint_hessian_triplets_parallel.size();
-                    constraint_hessian_triplets_parallel.resize(start_offset + total_triplets);
-
-                    // 3. Parallel Copy
-                    tbb::parallel_for(size_t(0), hess_storage.size(), [&](size_t i) {
-                        auto it = hess_storage.begin();
-                        std::advance(it, i);
-                        const auto& local = *it;
-
-                        std::copy(
-                            local.begin(),
-                            local.end(),
-                            constraint_hessian_triplets_parallel.begin() + start_offset + offsets[i]
-                        );
-                        });
-                    */
-                }
-                
-				if (c_parallel <= 0)
-                    V_prev = V;
-
-                if (outputs.size() > 0)
-                    outputs[0] = factory.createScalar<double>(c_parallel);
-                if (outputs.size() > 1) {
-                    outputs[1] = eigenToMatlab(grad_parallel);
-                }
-                if (outputs.size() > 2) {
-                    hessian_parallel.resize(ndof, ndof);
-                    hessian_parallel.setFromTriplets(constraint_hessian_triplets_parallel.begin(), constraint_hessian_triplets_parallel.end());
-                    nl_problem.full_hessian_to_reduced_hessian(hessian_parallel);
-
-                    CellArray cellContainer = factory.createCellArray({ 1, 1 });
-                    cellContainer[0] = eigenSparseToMatlab(hessian_parallel);
-                    outputs[2] = cellContainer;
-                }
-#endif
-                // Stop the timer
-                timer.stop();
-
-                // Get the elapsed time in seconds (as a double)
-                double elapsed_time = timer.getElapsedTime();
-                if (elapsed_time > 1) {
-                    printToMatlab("Total Time for eval_c : " + std::to_string(elapsed_time) + " seconds, Contact Number:" + std::to_string(collisions.size()) + ", double CCD Number : " + std::to_string(ccd_count) +'\n');
-                }
-
-                /*
-                for (size_t i = 0; i < collisions.size(); i++) {
-                    double toi = 0;
-                    ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                    ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                    double d = sqrt(collisions[i].compute_distance(dof));
-                    if (!collisions[i].ccd(dof0, dof, toi)) {
-                        d = -d;
-                    }
-
-                    //if (abs(d) < 1e-6) {
-                    //    c_parallel[i] = d;
-                    //    if (outputs.size() > 1) {
-                    //        auto v_ids = collisions[i].vertex_ids(E, F);
-                    //        Eigen::MatrixXd grad_full = Eigen::MatrixXd::Zero(ndof, 1);
-                    //        ipc::VectorMax12d local_grad = dof - dof0;
-                    //        for (size_t j = 0; j < local_grad.size(); j += 3) {
-                    //            local_grad.segment<3>(j).normalize();
-                    //        }
-                    //        ipc::local_gradient_to_global_gradient(local_grad, v_ids, collision_mesh.dim(), grad_full);
-                    //        grad_parallel.col(i) = nl_problem.full_to_reduced_grad(grad_full);
-                    //        printToMatlab("Collision" + std::to_string(i) + " d: " + std::to_string(c_parallel[i]) + ", gradient: " + eigenToString(grad_parallel.col(i).transpose()) + "\n");
-                    //    }
-                    //    if (outputs.size() > 2) {
-                    //        ipc::VectorMax12d local_vector = dof - dof0;
-                    //        ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                    //        local_hess.setZero();
-                    //        for (size_t j = 0; j < local_hess.cols(); j += 3) {
-                    //            double vector_norm = local_vector.segment<3>(j).norm();
-                    //            local_hess.block<3,3>(j,j) = (Eigen::Matrix3d::Identity() / vector_norm - (local_vector.segment<3>(j) * local_vector.segment<3>(j).transpose()) / pow(vector_norm, 3));
-                    //        }
-                    //        std::vector<Eigen::Triplet<double>> hessian_triplets;
-
-
-                    //        auto v_ids = collisions[i].vertex_ids(E, F);
-                    //        ipc::local_hessian_to_global_triplets(
-                    //            ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::NONE),
-                    //            v_ids, collision_mesh.dim(), hessian_triplets
-                    //        );
-                    //        hessian_parallel[i].resize(ndof, ndof);
-                    //        hessian_parallel[i].setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                    //        nl_problem.full_hessian_to_reduced_hessian(hessian_parallel[i]);
-                    //    }
-                    //    continue;
-                    //}
-
-                    if (d > 0) {
-                        c_parallel[i] = d + 5e-4;
-                        if (outputs.size() > 1) {
-                            auto v_ids = collisions[i].vertex_ids(E, F);
-                            Eigen::MatrixXd grad_full = Eigen::MatrixXd::Zero(ndof, 1);
-                            ipc::local_gradient_to_global_gradient(collisions[i].compute_distance_gradient(dof) / (2 * d), v_ids, collision_mesh.dim(), grad_full);
-                            //ipc::local_gradient_to_global_gradient(sign * collisions[i].compute_distance_gradient(dof), v_ids, collision_mesh.dim(), grad_full);
-                            grad_parallel.col(i) = nl_problem.full_to_reduced_grad(grad_full);
-                        }
-                        if (outputs.size() > 2) {
-                            // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                            ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-                            ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                            std::vector<Eigen::Triplet<double>> hessian_triplets;
-                            //if (i == 0)
-                            //    printToMatlab("Collision 0 dof: " + eigenToString(local_hess) + "\n");
-                            //local_hess = sign * local_hess;
-                            local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                            auto v_ids = collisions[i].vertex_ids(E, F);
-                            ipc::local_hessian_to_global_triplets(
-                                ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::NONE),
-                                v_ids, collision_mesh.dim(), hessian_triplets
-                            );
-                            hessian_parallel[i].resize(ndof, ndof);
-                            hessian_parallel[i].setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                            nl_problem.full_hessian_to_reduced_hessian(hessian_parallel[i]);
-                        }
-                    }
-                    else {
-                        hessian_parallel[i].resize(ndof, ndof);
-                        nl_problem.full_hessian_to_reduced_hessian(hessian_parallel[i]);
-					}
-                }
-                if (outputs.size() > 0)
-                    outputs[0] = eigenToMatlab(c_parallel);
-                if (outputs.size() > 1) {
-                    outputs[1] = eigenToMatlab(grad_parallel);
-                }
-				if (outputs.size() > 2) {
-                    CellArray cellContainer = factory.createCellArray({ 1, static_cast<unsigned long long>(nc) });
-					for (size_t i = 0; i < nc; i++) {
-                        cellContainer[i] = eigenSparseToMatlab(hessian_parallel[i]);
-                    }
-                    outputs[2] = cellContainer;
-                }
-                
-                // Stop the timer
-                timer.stop();
-
-                // Get the elapsed time in seconds (as a double)
-                double elapsed_time = timer.getElapsedTime();
-                if (elapsed_time > 1)
-                    printToMatlab("Time for eval_c : " + std::to_string(elapsed_time) + " seconds\n");
-                */
-
-                /*
-                double c = 0.0;
-                Eigen::VectorXd grad_full = Eigen::VectorXd::Zero(collision_mesh.num_vertices() * 3, 1);
-                Eigen::SparseMatrix<double> hessian;
-                std::vector<Eigen::Triplet<double>> hessian_triplets;
-
-                if (!candidates.empty())
-                {
-                    const Eigen::MatrixXi& E = collision_mesh.edges();
-                    const Eigen::MatrixXi& F = collision_mesh.faces();
-
-                    
-                    for (size_t i = 0; i < candidates.size(); i++)
-                    {
-                        double toi = 0;
-                        bool is_colliding = candidates[i].ccd(candidates[i].dof(V0, E, F), candidates[i].dof(V, E, F), toi);
-                        if (is_colliding) {
-                            double d = sqrt(candidates[i].compute_distance(candidates[i].dof(V, E, F)));
-                            c += d + 1e-3;
-                            if (outputs.size() > 1) {
-                                auto v_ids = candidates[i].vertex_ids(E, F);
-                                ipc::local_gradient_to_global_gradient(candidates[i].compute_distance_gradient(candidates[i].dof(V, E, F)) / (2 * d), v_ids, collision_mesh.dim(), grad_full);
-                            }
-                            if (outputs.size() > 2) {
-                                auto v_ids = candidates[i].vertex_ids(E, F);
-                                ipc::VectorMax12d local_grad = candidates[i].compute_distance_gradient(candidates[i].dof(V, E, F));
-                                ipc::MatrixMax12d local_hess = candidates[i].compute_distance_hessian(candidates[i].dof(V, E, F));
-                                local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-                                ipc::local_hessian_to_global_triplets(ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::ABS), v_ids, collision_mesh.dim(), hessian_triplets);
-                                //ipc::local_hessian_to_global_triplets(local_hess, v_ids, collision_mesh.dim(), hessian_triplets);
-                            }
-                        }
-                    }
-                    
-                }
-
-                //printToMatlab("thread num: " + std::to_string(tbb::this_task_arena::max_concurrency()) + '\n');
-                //if (abs(c - c_parallel) > 1e-8)
-                //    printToMatlab("c_diff: " + std::to_string(abs(c - c_parallel)) + '\n');
-                //if ((grad_full - grad_parallel).norm() > 1e-8)
-                //    printToMatlab("grad_diff_norm: " + std::to_string((grad_full - grad_parallel).norm()) + '\n');
-
-                if (outputs.size() > 0)
-                    outputs[0] = factory.createScalar<double>(c_parallel);
-                if (outputs.size() > 1) {
-                    Eigen::VectorXd grad = nl_problem.full_to_reduced_grad(grad_parallel);
-                    outputs[1] = eigenToMatlab(grad);
-                }
-                */
-            }
-            // --------------------------------------------------------------
-			// COMMAND: EVAL_H_MULT
-            // Usage: Hv = polyfem_problem_mex('eval_h_mult', handle, sol, sol_reduced, lambda, v)
-            // --------------------------------------------------------------
-            else if (cmd == "eval_h_mult") {
-                Eigen::MatrixXd sol;
-                Eigen::VectorXd tmp_sol;
-                Eigen::VectorXd l_ineq, l_eq, l_lb, l_ub;
-                Eigen::VectorXd v;
-                igl::Timer timer;
-                double prepare_time = 0;
-                double f_hessian_time = 0;
-                double collision_time = 0;
-                double c_hessian_time = 0;
-				double assembly_time = 0;
-                // Start the timer
-                timer.start();
-
-                double dhat = polyfem::Units::convert(state->args["contact"]["dhat"], state->units.length());
-				//std::vector<Eigen::Triplet<double>> constraint_hessian_triplets;
-                //std::vector<Eigen::Triplet<double>> constraint_hessian_triplets_parallel;
-
-                // Accept Inputs 
-                if (inputs.size() == 6 &&
-                    inputs[2].getType() == ArrayType::DOUBLE &&
-                    inputs[3].getType() == ArrayType::DOUBLE &&
-					inputs[4].getType() == ArrayType::STRUCT &&
-                    inputs[5].getType() == ArrayType::DOUBLE)
-                     {
-                    matlabToEigen(inputs[2], sol);
-                    matlabToEigen(inputs[3], tmp_sol);
-                    StructArray lambda = inputs[4];
-                    extractLambdaField(lambda, "ineqnonlin", l_ineq);
-                    extractLambdaField(lambda, "eqnonlin", l_eq);
-                    extractLambdaField(lambda, "lower", l_lb);
-                    extractLambdaField(lambda, "upper", l_ub);
-                    matlabToEigen(inputs[5], v);
-                }
-                else {
-                    throw std::runtime_error("Usage: Hv = polyfem_problem_mex('eval_h_mult', handle, sol, sol_reduced, lambda, v)");
-                }
-
-                assert(state->solve_data.nl_problem != nullptr);
-                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
-                Eigen::SparseMatrix<double> hessian_f;
-                Eigen::VectorXd Hv;
-                //tbb::combinable<Eigen::VectorXd> Hc_v(Eigen::VectorXd::Zero(tmp_sol.size()));
-
-                timer.stop();
-                prepare_time = timer.getElapsedTime();
-				timer.start();
-
-                nl_problem.hessian(tmp_sol, hessian_f);
-                Hv = hessian_f * v;
-
-				timer.stop();
-				f_hessian_time = timer.getElapsedTime();
-
-#ifdef USE_PERSISTANT_CANDIDATES
-                if (candidates->size() > 1) {
-                    const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                    Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
-                    Eigen::MatrixXd V0 = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
-                    assert(V.rows() == collision_mesh.num_vertices());
-                    assert(V0.rows() == collision_mesh.num_vertices());
-                    const Eigen::MatrixXi& E = collision_mesh.edges();
-                    const Eigen::MatrixXi& F = collision_mesh.faces();
-                    ipc::Candidates& collisions = *candidates;
-                    const int ndof = collision_mesh.num_vertices() * collision_mesh.dim();
-                    /*
-                    // A. Parallel Computation
-                    tbb::parallel_for(tbb::blocked_range<size_t>(0, collisions.size()),
-                        [&](const tbb::blocked_range<size_t>& r) {
-                            for (size_t i = r.begin(); i != r.end(); i++) {
-                                double d;
-                                double toi = 0;
-                                auto dof = collisions[i].dof(V, E, F);
-                                // Re-run CCD check for the Hessian phase
-                                if (collisions[i].ccd(collisions[i].dof(V0, E, F), dof, toi)) 
-                                    d = sqrt(collisions[i].compute_distance(dof));
-                                else
-									d = -sqrt(collisions[i].compute_distance(dof));
-
-                                // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                                ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-                                ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                                std::vector<Eigen::Triplet<double>> hessian_triplets;
-                                Eigen::SparseMatrix<double> hessian_c;
-
-                                // Barrier formula
-                                local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                                auto v_ids = collisions[i].vertex_ids(E, F);
-                                ipc::local_hessian_to_global_triplets(
-                                    ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::ABS),
-                                    v_ids, collision_mesh.dim(), hessian_triplets
-                                );
-                                hessian_c.resize(ndof, ndof);
-                                hessian_c.setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                                nl_problem.full_hessian_to_reduced_hessian(hessian_c);
-								Hc_v.local() = l_ineq[i] * (hessian_c * v);
-                            }
-                        }
-                    );
-					Hv += Hc_v.combine([](const Eigen::VectorXd& a, const Eigen::VectorXd& b) { return a + b; });
-                    */
-                    for (size_t i = 0; i < collisions.size(); i++) {
-                        double toi = 0;
-                        ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
-                        ipc::VectorMax12d dof0 = collisions[i].dof(V0, E, F);
-                        double d = sqrt(collisions[i].compute_distance(dof));
-                        // Re-run CCD check for the Hessian phase
-                        timer.start();
-                        if (!collisions[i].ccd(dof0, dof, toi))
-                            d = -d;
-                        timer.stop();
-                        double tmp_time = timer.getElapsedTime();
-                        //if (tmp_time > 1e-1)
-                        //	printToMatlab("collision detection time for hessian of constraint " + std::to_string(i) + ": " + std::to_string(tmp_time) + " seconds\n");
-                        collision_time += tmp_time;
-
-                        timer.start();
-                        //if (abs(d) < 1e-6) {
-                        //    ipc::VectorMax12d local_vector = dof - dof0;
-                        //    ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                        //    local_hess.setZero();
-                        //    for (size_t j = 0; j < local_hess.cols(); j += 3) {
-                        //        double vector_norm = local_vector.segment<3>(j).norm();
-                        //        local_hess.block<3, 3>(j, j) = (Eigen::Matrix3d::Identity() / vector_norm - (local_vector.segment<3>(j) * local_vector.segment<3>(j).transpose()) / pow(vector_norm, 3));
-                        //    }
-                        //    std::vector<Eigen::Triplet<double>> hessian_triplets;
-                        //    Eigen::SparseMatrix<double> hessian_c;
-
-                        //    auto v_ids = collisions[i].vertex_ids(E, F);
-                        //    ipc::local_hessian_to_global_triplets(
-                        //        ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::NONE),
-                        //        v_ids, collision_mesh.dim(), hessian_triplets
-                        //    );
-                        //    hessian_c.resize(ndof, ndof);
-                        //    hessian_c.setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                        //    nl_problem.full_hessian_to_reduced_hessian(hessian_c);
-                        //    Hv += l_ineq[i] * (hessian_c * v);
-                        //    continue;
-                        //}
-
-                        // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                        ipc::VectorMax12d local_grad = collisions[i].compute_distance_gradient(dof);
-                        ipc::MatrixMax12d local_hess = collisions[i].compute_distance_hessian(dof);
-                        std::vector<Eigen::Triplet<double>> hessian_triplets;
-                        Eigen::SparseMatrix<double> hessian_c;
-                        //local_hess = sign * local_hess;
-                        local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                        auto v_ids = collisions[i].vertex_ids(E, F);
-                        ipc::local_hessian_to_global_triplets(
-                            ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::ABS),
-                            v_ids, collision_mesh.dim(), hessian_triplets
-                        );
-                        hessian_c.resize(ndof, ndof);
-                        hessian_c.setFromTriplets(hessian_triplets.begin(), hessian_triplets.end());
-                        nl_problem.full_hessian_to_reduced_hessian(hessian_c);
-                        Hv += l_ineq[i] * (hessian_c * v);
-
-						timer.stop();
-						assembly_time += timer.getElapsedTime();
-                    }
-					c_hessian_time = collision_time + assembly_time;
-                }
-
-                outputs[0] = eigenToMatlab(Hv);
-
-                if (prepare_time + f_hessian_time + c_hessian_time > 1) {
-                    printToMatlab("Time for eval_h_mult: " + std::to_string(prepare_time + f_hessian_time + c_hessian_time) + " seconds\n");
-                    printToMatlab("Prepare Time: " + std::to_string(prepare_time) + " seconds\n");
-                    printToMatlab("f Hessian Time: " + std::to_string(f_hessian_time) + " seconds\n");
-                    printToMatlab("c Hessian Time: " + std::to_string(c_hessian_time) + " = " + std::to_string(collision_time) + '+' + std::to_string(assembly_time) + " seconds\n");
-                }
-#else
-                outputs[0] = eigenToMatlab(Hv);
-#endif
-                /*
-				if (l_ineq.size() < 1)
-                    throw std::runtime_error("Invalid input arguments. Lambda for nonlinear inequality constraint can't be empty.");
 
                 assert(state.solve_data.nl_problem != nullptr);
                 polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
-                Eigen::SparseMatrix<double> hessian_f;
-                Eigen::SparseMatrix<double> hessian_c;
-                Eigen::SparseMatrix<double> hessian_c_parallel;
-                Eigen::VectorXd Hv;
+                nl_problem.solution_changed(tmp_sol);
+                //if(is_step_valid)
+                //    is_step_valid = nl_problem.is_step_collision_free(nl_problem.full_to_reduced(sol), tmp_sol);
 
-                const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
-                Eigen::MatrixXd V0 = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
-                assert(V.rows() == collision_mesh.num_vertices());
-                assert(V0.rows() == collision_mesh.num_vertices());
-                candidates.build(collision_mesh, V0, V, dhat / 2);
+                //logger().debug("1: Is step valid? {}", is_step_valid);
+                /*
+                for (auto form : nl_problem.forms()) {
+                    logger().info("form name: {}", form->name());
+                    form->second_derivative()
+                }
+                */
+                if (outputs.size() > 0) {
+                    //Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+                    Eigen::SparseMatrix<double> hessian;
+                    Eigen::SparseMatrix<double> broad_phase_hessian;
+                    const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
+                    const int ndof = collision_mesh.num_vertices() * collision_mesh.dim();
 
-
-                if (!candidates.empty()) {
-                    using TripletVector = std::vector<Eigen::Triplet<double>>;
-                    tbb::enumerable_thread_specific<TripletVector> hess_storage;
-                    const Eigen::MatrixXi& E = collision_mesh.edges();
-                    const Eigen::MatrixXi& F = collision_mesh.faces();
-
-                    // A. Parallel Computation
-                    tbb::parallel_for(tbb::blocked_range<size_t>(0, candidates.size()),
-                        [&](const tbb::blocked_range<size_t>& r) {
-
-                            TripletVector& local_triplets = hess_storage.local();
-
-                            for (size_t i = r.begin(); i != r.end(); i++) {
-                                double toi = 0;
-                                // Re-run CCD check for the Hessian phase
-                                if (candidates[i].ccd(candidates[i].dof(V0, E, F), candidates[i].dof(V, E, F), toi)) {
-
-                                    auto dof = candidates[i].dof(V, E, F);
-                                    double d = sqrt(candidates[i].compute_distance(dof));
-
-                                    // Compute Local Hessian & Gradient (needed for barrier Hessian)
-                                    ipc::VectorMax12d local_grad = candidates[i].compute_distance_gradient(dof);
-                                    ipc::MatrixMax12d local_hess = candidates[i].compute_distance_hessian(dof);
-
-                                    // Barrier formula
-                                    local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-
-                                    auto v_ids = candidates[i].vertex_ids(E, F);
-                                    ipc::local_hessian_to_global_triplets(
-                                        ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::ABS),
-                                        v_ids, collision_mesh.dim(), local_triplets
-                                    );
-                                }
+                    nl_problem.set_project_to_psd(true);
+                    nl_problem.hessian(tmp_sol, hessian);
+                    for (int k = 0; k < hessian.outerSize(); ++k) {
+                        for (Eigen::SparseMatrix<double>::InnerIterator it(hessian, k); it; ++it) {
+                            if (it.value() != 0.0) {
+                                it.valueRef() = 1.0;
                             }
                         }
-                    );
+                    }
+                    //logger().info("Hessian size:  {}", hessian.cols());
+                    std::vector<Eigen::Triplet<double>> broad_phase_hessian_triplets;
+                    broad_phase_hessian_triplets.clear();
 
-                    // B. Fast Assembly (Offset + Copy)
+                    ipc::Candidates& collisions = *candidates;
+                    double dhat = polyfem::Units::convert(state->args["contact"]["dhat"], state->units.length());
 
-                    // 1. Calculate offsets
-                    std::vector<size_t> offsets(hess_storage.size());
-                    size_t total_triplets = 0;
-                    size_t idx = 0;
-                    for (const auto& local : hess_storage) {
-                        offsets[idx++] = total_triplets;
-                        total_triplets += local.size();
+                    Eigen::MatrixXd V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(tmp_sol), collision_mesh.dim()));
+                    collisions.build(collision_mesh, V, dhat * 20, std::make_shared<ipc::SweepAndPrune>());
+                    const Eigen::MatrixXi& E = collision_mesh.edges();
+                    const Eigen::MatrixXi& F = collision_mesh.faces();
+                    logger().info("Broad phase size:  {}", collisions.size());
+
+                    for (size_t i = 0; i < collisions.size(); i++) {
+                        int dof = collisions[i].num_vertices() * 3;
+                        auto v_ids = collisions[i].vertex_ids(E, F);
+                        
+                        ipc::local_hessian_to_global_triplets(ipc::MatrixMax12d::Ones(dof,dof),
+                            v_ids, collision_mesh.dim(), broad_phase_hessian_triplets);
+                            
                     }
 
-                    // 2. Single allocation
-                    size_t start_offset = constraint_hessian_triplets_parallel.size();
-                    constraint_hessian_triplets_parallel.resize(start_offset + total_triplets);
+                    //logger().info("Triplets size:  {}", broad_phase_hessian_triplets.size());
+                    broad_phase_hessian.resize(ndof, ndof);
+                    broad_phase_hessian.setFromTriplets(broad_phase_hessian_triplets.begin(), broad_phase_hessian_triplets.end());
+                    //logger().info("ndof:  {}", ndof);
+                    broad_phase_hessian = collision_mesh.to_full_dof(broad_phase_hessian);
+                    //logger().info("full ndof:  {}", broad_phase_hessian.cols());
+                    nl_problem.full_hessian_to_reduced_hessian(broad_phase_hessian);
+                    //logger().info("reduced dof:  {}", broad_phase_hessian.cols());
 
-                    // 3. Parallel Copy
-                    tbb::parallel_for(size_t(0), hess_storage.size(), [&](size_t i) {
-                        auto it = hess_storage.begin();
-                        std::advance(it, i);
-                        const auto& local = *it;
-
-                        std::copy(
-                            local.begin(),
-                            local.end(),
-                            constraint_hessian_triplets_parallel.begin() + start_offset + offsets[i]
-                        );
-                        });
+                    hessian += broad_phase_hessian;
+                    for (int k = 0; k < hessian.outerSize(); ++k) {
+                        for (Eigen::SparseMatrix<double>::InnerIterator it(hessian, k); it; ++it) {
+                            if (it.value() != 0.0) {
+                                it.valueRef() = 1.0;
+                            }
+                        }
+                    }
+                    
+                    outputs[0] = eigenSparseToMatlab(hessian);
                 }
+                // Stop the timer
+                timer.stop();
 
-                hessian_c_parallel.resize(collision_mesh.num_vertices() * 3, collision_mesh.num_vertices() * 3);
-                hessian_c_parallel.setFromTriplets(constraint_hessian_triplets_parallel.begin(), constraint_hessian_triplets_parallel.end());
-                nl_problem.full_hessian_to_reduced_hessian(hessian_c_parallel);
-                */
-
-    //            if (!candidates.empty())
-    //            {
-    //                const Eigen::MatrixXi& E = collision_mesh.edges();
-    //                const Eigen::MatrixXi& F = collision_mesh.faces();
-
-    //                for (size_t i = 0; i < candidates.size(); i++)
-    //                {
-    //                    double toi = 0;
-    //                    bool is_colliding = candidates[i].ccd(candidates[i].dof(V0, E, F), candidates[i].dof(V, E, F), toi);
-    //                    if (is_colliding) {
-    //                        double d = sqrt(candidates[i].compute_distance(candidates[i].dof(V, E, F)));
-    //                        auto v_ids = candidates[i].vertex_ids(E, F);
-    //                        ipc::VectorMax12d local_grad = candidates[i].compute_distance_gradient(candidates[i].dof(V, E, F));
-    //                        ipc::MatrixMax12d local_hess = candidates[i].compute_distance_hessian(candidates[i].dof(V, E, F));
-    //                        local_hess = local_hess / (2 * d) - (local_grad * local_grad.transpose()) / (4 * std::pow(d, 3));
-    //                        ipc::local_hessian_to_global_triplets(ipc::project_to_psd(local_hess, ipc::PSDProjectionMethod::ABS), v_ids, collision_mesh.dim(), constraint_hessian_triplets);
-    //                        //ipc::local_hessian_to_global_triplets(local_hess, v_ids, collision_mesh.dim(), constraint_hessian_triplets);
-    //                    }
-    //                }
-    //            }
-
-    //            hessian_c.resize(collision_mesh.num_vertices() * 3, collision_mesh.num_vertices() * 3);
-				//hessian_c.setFromTriplets(constraint_hessian_triplets.begin(), constraint_hessian_triplets.end());
-    //            nl_problem.full_hessian_to_reduced_hessian(hessian_c);
-                //if((hessian_c - hessian_c_parallel).norm() > 1e-6)
-                //    polyfem::logger().info("hessian and hessian_parallel are different, norm: {}", (hessian_c - hessian_c_parallel).norm());
-
-                //if (constraint_hessian_triplets_parallel.size() > 0)
-                //    Hv =  l_ineq[0] * hessian_c_parallel * v;
-                //else {
-                //    nl_problem.hessian(tmp_sol, hessian_f);
-                //    Hv = hessian_f * v;
-                //}
-
-                //nl_problem.hessian(tmp_sol, hessian_f);
-                //Hv = (hessian_f + l_ineq[0] * hessian_c_parallel) * v;
-                //outputs[0] = eigenToMatlab(Hv);
+                // Get the elapsed time in seconds (as a double)
+                double elapsed_time = timer.getElapsedTime();
+                //sim_stat.objective_time += elapsed_time;
+                printToMatlab("Time for computing hessian pattern : " + std::to_string(elapsed_time) + " seconds\n");
             }
             // --------------------------------------------------------------
             // COMMAND: SOLVE
@@ -1463,29 +1089,6 @@ public:
                     outputs[0] = eigenToMatlab(tmp_sol);
             }
             // --------------------------------------------------------------
-            // COMMAND: POST SOLVE
-            // [sol] = polyfem_problem_mex('post_solve', handle, sol_reduced, project_hessian)
-            // --------------------------------------------------------------
-            else if (cmd == "post_solve") {
-                Eigen::VectorXd tmp_sol;
-                bool project_hessian;
-                // Accept Inputs 
-                if (inputs.size() == 4 && inputs[2].getType() == ArrayType::DOUBLE && inputs[3].getType() == ArrayType::LOGICAL) {
-                    matlabToEigen(inputs[2], tmp_sol);
-                    TypedArray<bool> val = inputs[3];
-                    project_hessian = val[0];
-                }
-                else {
-                    throw std::runtime_error("Invalid input arguments. Usage: sol_reduced = polyfem_problem_mex('solve', handle, sol_reduced)");
-                }
-                polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
-                nl_problem.set_project_to_psd(project_hessian);
-                json solver_info;
-                Eigen::VectorXd grad;
-                nl_problem.gradient(tmp_sol, grad);
-                nl_problem.post_step(polysolve::nonlinear::PostStepData(1, solver_info, tmp_sol, grad));
-            }
-            // --------------------------------------------------------------
             // COMMAND: SAVE
             // [sol] = polyfem_problem_mex('save', handle, sol_reduced, t)
             // --------------------------------------------------------------
@@ -1522,6 +1125,23 @@ public:
 				if (outputs.size() > 0)
 				    outputs[0] = eigenToMatlab(sol);
             }
+            // --------------------------------------------------------------
+            // COMMAND: clear statistics
+            // [sol] = polyfem_problem_mex('clear', state)
+            // --------------------------------------------------------------
+            else if (cmd == "clear") {
+                //logger().info("Clear sim statistics");
+                sim_stat.total_time = 0;
+                sim_stat.init_time = 0;
+                sim_stat.objective_time = 0;
+                sim_stat.collision_time = 0;
+                sim_stat.extra_factorizing_time = 0;
+                sim_stat.func_eval = 0;
+                sim_stat.hessian_eval = 0;
+                sim_stat.ccd_count = 0;
+                //logger().info("Current total time: {}s, initial time: {}s, objective funcioin time: {}s, extra factorization time: {}s, collision time: {}s.", sim_stat.total_time, sim_stat.init_time, sim_stat.objective_time, sim_stat.extra_factorizing_time, sim_stat.collision_time);
+                //logger().info("Current total function evaluations: {}, total hessian evaluations: {}, ccd count: {}", sim_stat.func_eval, sim_stat.hessian_eval, sim_stat.ccd_count);
+                }
             else {
                 throw std::runtime_error("Unknown command: " + cmd);
             }
@@ -1674,7 +1294,7 @@ private:
         ss << mat;
         return ss.str();
     }
-
+    /*
     // --------------------------------------------------------------------------
     // HELPER: Double CCD: Vertex face
     // --------------------------------------------------------------------------
@@ -1726,7 +1346,7 @@ private:
             dt.a0, dt.a1, dt.b0, dt.b1, dt.a0b, dt.a1b, dt.b0b, dt.b1b
         );
     }
-
+    */
     // --------------------------------------------------------------------------
     // HELPER: IPC minimizer
     // --------------------------------------------------------------------------
@@ -1980,3 +1600,5 @@ Eigen::VectorXd MexFunction::sol_ls_1;
 std::vector<double> MexFunction::t_list;
 SimStatistics MexFunction::sim_stat;
 std::unique_ptr<ipc::Candidates> MexFunction::candidates = nullptr;
+double MexFunction::bc_al_weight = 0.0;
+double MexFunction::bc_initial_error = 0.0;
