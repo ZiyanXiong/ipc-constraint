@@ -125,7 +125,7 @@ struct SimStatistics {
     double total_time = 0;
     double init_time = 0;
     double objective_time = 0;
-	double collision_time = 0;
+    double collision_time = 0;
     double extra_factorizing_time = 0;
     int func_eval = 0;
     int hessian_eval = 0;
@@ -211,7 +211,7 @@ Eigen::VectorXd prepare(polyfem::State& state, Eigen::MatrixXd& sol, int t) {
     polyfem::logger().debug("Successfully applied constraints conditions; solving in reduced space");
     nl_problem.init(sol);
     state.solve_data.update_barrier_stiffness(sol);
-	return tmp_sol;
+    return tmp_sol;
 }
 
 // ==============================================================================
@@ -260,7 +260,7 @@ class MexFunction : public matlab::mex::Function {
     static Eigen::MatrixXd V_prev;
     static Eigen::VectorXd sol_ls_0;
     static Eigen::VectorXd sol_ls_1;
-	static std::vector<double> t_list;
+    static std::vector<double> t_list;
     static SimStatistics sim_stat;
     static std::unique_ptr<ipc::Candidates> candidates;
     static double bc_al_weight;
@@ -309,8 +309,8 @@ public:
                 else {
                     throw std::runtime_error("Invalid input arguments. Usage: polyfem_problem_mex('init', handle, sol, t)");
                 }
-                //sim_stat.timer.start();
-                //sim_stat.init_timer.start();
+                sim_stat.timer.start();
+                sim_stat.init_timer.start();
                 using namespace polyfem::solver; // For ALSolver, NLProblem
 
                 const double t0 = state->args["time"]["t0"];
@@ -532,7 +532,7 @@ public:
                 polyfem::logger().debug("Successfully applied constraints conditions; solving in reduced space");
                 nl_problem.init(sol);
                 state->solve_data.update_barrier_stiffness(sol);
-                
+
                 outputs[0] = eigenToMatlab(tmp_sol);
             }
             // --------------------------------------------------------------
@@ -555,16 +555,20 @@ public:
 
                 for (const auto& f : alagr_forms)
                     current_error += f->compute_error(sol);
-                logger().debug("Current error = {}", current_error);
+                logger().debug("Current error = {}, bc_initial_error = {}", current_error, bc_initial_error);
                 const double eta = 1 - sqrt(current_error / bc_initial_error);
 
                 nl_problem.use_reduced_size();
                 Eigen::VectorXd tmp_sol = nl_problem.full_to_reduced(sol);
                 nl_problem.line_search_begin(sol, tmp_sol);
-                bool is_bc_converged = (std::isfinite(nl_problem.value(tmp_sol))
+                //bool is_bc_converged = std::isfinite(nl_problem.value(tmp_sol))
+                //    && nl_problem.is_step_valid(sol, tmp_sol)
+                //    && nl_problem.is_step_collision_free(sol, tmp_sol) && eta > 0.999 || bc_initial_error == 0;
+                bool is_bc_converged = std::isfinite(nl_problem.value(tmp_sol))
                     && nl_problem.is_step_valid(sol, tmp_sol)
-                    && nl_problem.is_step_collision_free(sol, tmp_sol) && eta > 0.999);
+                    && nl_problem.is_step_collision_free(sol, tmp_sol);
                 nl_problem.line_search_end();
+                logger().debug("is_bc_converged = {}, is f finite = {}, is_step_valid = {}, is_step_collision_free = {}, eta = {}", is_bc_converged, std::isfinite(nl_problem.value(tmp_sol)), nl_problem.is_step_valid(sol, tmp_sol), nl_problem.is_step_collision_free(sol, tmp_sol), eta);
 
                 nl_problem.use_full_size();
                 logger().info("Solving AL Problem with weight {}", bc_al_weight);
@@ -636,7 +640,7 @@ public:
                     sol = sol_ls_0;
                 }
 
-                if (eta < eta_tol && bc_al_weight <max_weight)
+                if (eta < eta_tol && bc_al_weight < max_weight)
                     bc_al_weight *= scaling;
 
                 for (auto& f : alagr_forms)
@@ -684,8 +688,8 @@ public:
                     mexUnlock();
                 }
                 candidates = std::make_unique<ipc::Candidates>();
-                //sim_stat.init_timer.stop();
-                //sim_stat.init_time += sim_stat.init_timer.getElapsedTime();
+                sim_stat.init_timer.stop();
+                sim_stat.init_time += sim_stat.init_timer.getElapsedTime();
                 outputs[0] = eigenToMatlab(tmp_sol);
             }
 
@@ -702,7 +706,7 @@ public:
                 if (inputs.size() == 5 && inputs[2].getType() == ArrayType::DOUBLE) {
                     matlabToEigen(inputs[2], sol);
                     t = getInt(inputs[3]);
-					inflation_radius = inputs[4][0];
+                    inflation_radius = inputs[4][0];
                 }
                 else {
                     throw std::runtime_error("Invalid input arguments. Usage: [sol, sol_reduced] = polyfem_problem_mex('prepare', handle, sol, t, inflation_radius)");
@@ -710,10 +714,10 @@ public:
                 sim_stat.timer.start();
                 igl::Timer init_timer;
                 init_timer.start();
-				Eigen::VectorXd sol_reduced = prepare(*state, sol, t);
+                Eigen::VectorXd sol_reduced = prepare(*state, sol, t);
                 V_prev = state->collision_mesh.displace_vertices(utils::unflatten(sol, state->collision_mesh.dim()));
-				sol_ls_0 = sol_reduced;
-				sol_ls_1 = sol_reduced;
+                sol_ls_0 = sol_reduced;
+                sol_ls_1 = sol_reduced;
                 if (candidates) {
                     candidates.reset();
                     mexUnlock();
@@ -742,11 +746,11 @@ public:
                 mexLock();
 #endif
 
-				outputs[0] = eigenToMatlab(sol);
-				outputs[1] = eigenToMatlab(sol_reduced);
+                outputs[0] = eigenToMatlab(sol);
+                outputs[1] = eigenToMatlab(sol_reduced);
             }
             // --------------------------------------------------------------
-			// COMMAND: EVAL_F
+            // COMMAND: EVAL_F
             // Usage: [f,g,h] = polyfem_problem_mex('eval_f', handle, sol_reduced)
             // --------------------------------------------------------------
             else if (cmd == "eval_f") {
@@ -768,15 +772,15 @@ public:
                 polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
                 double f = 0.0;
                 Eigen::VectorXd grad;
-				nl_problem.solution_changed(sol);
+                nl_problem.solution_changed(sol);
                 //bool is_step_valid = true;
 
-				igl::Timer collision_timer;
-				collision_timer.start();
+                igl::Timer collision_timer;
+                collision_timer.start();
                 const ipc::CollisionMesh& collision_mesh = state->collision_mesh;
-                
+
                 Eigen::MatrixXd V;
-                if(sol.size() == nl_problem.full_size())
+                if (sol.size() == nl_problem.full_size())
                     V = collision_mesh.displace_vertices(utils::unflatten(sol, collision_mesh.dim()));
                 else
                     V = collision_mesh.displace_vertices(utils::unflatten(nl_problem.reduced_to_full(sol), collision_mesh.dim()));
@@ -799,8 +803,8 @@ public:
                     }
                 }
                 */
-                
-                if(is_step_valid)
+
+                if (is_step_valid)
                 {
                     ipc::Candidates& collisions = *candidates;
                     double dhat = polyfem::Units::convert(state->args["contact"]["dhat"], state->units.length());
@@ -846,7 +850,7 @@ public:
                                         ipc::VectorMax12d dof = collisions[i].dof(V, E, F);
                                         ipc::VectorMax12d dof0 = collisions[i].dof(V_prev, E, F);
                                         is_colliding = collisions[i].ccd(dof0, dof, t_list[i]);
-                                        
+
                                         //if(is_colliding)
                                         //{
                                         //    if (i < collisions.vv_candidates.size() + collisions.ev_candidates.size())
@@ -858,7 +862,7 @@ public:
                                         //    else
                                         //        polyfem::log_and_throw_error("Index out of candidates range.");
                                         //}
-                                        
+
                                         if (is_colliding) {
                                             is_step_valid = false;
                                         }
@@ -868,11 +872,11 @@ public:
                     }
                     */
                 }
-                
-				collision_timer.stop();
-				sim_stat.collision_time += collision_timer.getElapsedTime();
+
+                collision_timer.stop();
+                sim_stat.collision_time += collision_timer.getElapsedTime();
                 sim_stat.func_eval++;
-                
+
                 if (outputs.size() > 0) {
                     f = nl_problem(sol);
                     if (!is_step_valid) {
@@ -888,10 +892,10 @@ public:
                 if (outputs.size() > 2) {
                     //Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
                     Eigen::SparseMatrix<double> hessian;
-
+                    sim_stat.hessian_eval++;
                     if (is_step_valid) {
                         //logger().debug("Grad Norm: {:g}", grad.norm());
-                        if (grad.lpNorm<Eigen::Infinity>() > 1e-4) 
+                        if (grad.lpNorm<Eigen::Infinity>() > 1e-5)
                         {
                             try {
                                 nl_problem.set_project_to_psd(true);
@@ -903,10 +907,9 @@ public:
                                 hessian.setZero();
                             }
                         }
-                        else 
+                        else
                         {
                             //logger().info("Switch to unprojected hessian");
-                            sim_stat.hessian_eval++;
                             nl_problem.set_project_to_psd(false);
                             nl_problem.hessian(sol, hessian);
 
@@ -930,7 +933,7 @@ public:
                                     //logger().info("Invalid hessian, return 0 hessian");
                                     hessian.setZero();
                                 }
-							}
+                            }
                             factorization_timer.stop();
                             sim_stat.extra_factorizing_time += factorization_timer.getElapsedTime();
                         }
@@ -1014,10 +1017,10 @@ public:
                     for (size_t i = 0; i < collisions.size(); i++) {
                         int dof = collisions[i].num_vertices() * 3;
                         auto v_ids = collisions[i].vertex_ids(E, F);
-                        
-                        ipc::local_hessian_to_global_triplets(ipc::MatrixMax12d::Ones(dof,dof),
+
+                        ipc::local_hessian_to_global_triplets(ipc::MatrixMax12d::Ones(dof, dof),
                             v_ids, collision_mesh.dim(), broad_phase_hessian_triplets);
-                            
+
                     }
 
                     //logger().info("Triplets size:  {}", broad_phase_hessian_triplets.size());
@@ -1037,7 +1040,7 @@ public:
                             }
                         }
                     }
-                    
+
                     outputs[0] = eigenSparseToMatlab(hessian);
                 }
                 // Stop the timer
@@ -1110,20 +1113,20 @@ public:
                 polyfem::solver::NLProblem& nl_problem = *(state->solve_data.nl_problem);
                 nl_problem.finish();
                 sol = nl_problem.reduced_to_full(tmp_sol);
-				save(*state, sol, t);
+                save(*state, sol, t);
 
                 sim_stat.timer.stop();
                 sim_stat.total_time += sim_stat.timer.getElapsedTime();
                 logger().info("Current total time: {}s, initial time: {}s, objective funcioin time: {}s, extra factorization time: {}s, collision time: {}s.", sim_stat.total_time, sim_stat.init_time, sim_stat.objective_time, sim_stat.extra_factorizing_time, sim_stat.collision_time);
                 logger().info("Current total function evaluations: {}, total hessian evaluations: {}, ccd count: {}", sim_stat.func_eval, sim_stat.hessian_eval, sim_stat.ccd_count);
 
-                if(candidates) {
+                if (candidates) {
                     candidates.reset();
                     mexUnlock();
-				}
+                }
 
-				if (outputs.size() > 0)
-				    outputs[0] = eigenToMatlab(sol);
+                if (outputs.size() > 0)
+                    outputs[0] = eigenToMatlab(sol);
             }
             // --------------------------------------------------------------
             // COMMAND: clear statistics
@@ -1141,7 +1144,7 @@ public:
                 sim_stat.ccd_count = 0;
                 //logger().info("Current total time: {}s, initial time: {}s, objective funcioin time: {}s, extra factorization time: {}s, collision time: {}s.", sim_stat.total_time, sim_stat.init_time, sim_stat.objective_time, sim_stat.extra_factorizing_time, sim_stat.collision_time);
                 //logger().info("Current total function evaluations: {}, total hessian evaluations: {}, ccd count: {}", sim_stat.func_eval, sim_stat.hessian_eval, sim_stat.ccd_count);
-                }
+            }
             else {
                 throw std::runtime_error("Unknown command: " + cmd);
             }
@@ -1212,7 +1215,7 @@ private:
     // --------------------------------------------------------------------------
     // HELPER: Extract Field from MATLAB Struct -> Eigen Vector
     // --------------------------------------------------------------------------
-    void extractLambdaField(const StructArray & s, const std::string & field, Eigen::VectorXd & out) {
+    void extractLambdaField(const StructArray& s, const std::string& field, Eigen::VectorXd& out) {
         // MATLAB StructArray can handle field lookup
         // Fix: Removing 'const' here to allow calling begin() on the Range object if needed
         auto fields = s.getFieldNames();
@@ -1313,7 +1316,7 @@ private:
         dt.x1b = vertices_t1.segment<3>(3);
         dt.x2b = vertices_t1.segment<3>(6);
         dt.x3b = vertices_t1.segment<3>(9);
-		double time;
+        double time;
         double err = shift_vertex_face(dt, dtshift, time);
         dt = dtshift;
         return doubleccd::vertexFaceCCD(
